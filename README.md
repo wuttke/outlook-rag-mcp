@@ -125,3 +125,9 @@ against `HUMAN_FOLDERS`, so subfolders are not implicitly included.
 - Re-running export or ingest is always safe; both are idempotent.
 - The exporter is best-effort: OST sync races and COM watermark quirks mean a
   single pass can miss items. `refresh.sh` works around this by looping.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+Copyright 2026 Matthias Wuttke.
