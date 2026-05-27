@@ -50,6 +50,9 @@ def table():
     if _table is None:
         db = lancedb.connect(str(DB_DIR))
         _table = db.open_table(TABLE_NAME)
+    else:
+        # Pick up rows appended by ingest.py since the table was first opened.
+        _table.checkout_latest()
     return _table
 
 
