@@ -1,0 +1,21 @@
+# Embeddings & state — never publish
+db/
+*.lance/
+logs/
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only configs
+.env
+.env.*
