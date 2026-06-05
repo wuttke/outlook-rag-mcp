@@ -13,7 +13,6 @@ Run (stdio transport, for Claude Desktop / VSCode-style MCP clients):
 from __future__ import annotations
 
 import os
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -188,15 +187,10 @@ def search_metadata(
                          subject_contains=subject_contains, since=since,
                          until=until, keywords=keywords)
     ds = table().to_lance()
-    scanner = ds.scanner(
-        filter=where,
-        columns=PROJECT_COLS,
-        limit=max(k * 10, 200),
-    )
-    rows = scanner.to_table().to_pylist()
-    reverse = sort != "date_asc"
-    rows.sort(key=lambda r: r.get("date") or datetime.min, reverse=reverse)
-    deduped = _dedup_by_email(rows, k)
+    tbl = ds.scanner(filter=where, columns=PROJECT_COLS).to_table()
+    order = "ascending" if sort == "date_asc" else "descending"
+    tbl = tbl.sort_by([("date", order)])
+    deduped = _dedup_by_email(tbl.to_pylist(), k)
     return [_format(r) for r in deduped]
 
 
@@ -276,10 +270,9 @@ def search_hybrid(
     where_kw = _build_where(folder=folder, from_addr=from_addr, to_addr=to_addr,
                             since=since, until=until, keywords=keywords)
     ds = table().to_lance()
-    kw_rows = ds.scanner(filter=where_kw, columns=PROJECT_COLS,
-                         limit=pool * 10).to_table().to_pylist()
-    kw_rows.sort(key=lambda r: r.get("date") or datetime.min, reverse=True)
-    kw_rows = _dedup_by_email(kw_rows, pool)
+    kw_tbl = ds.scanner(filter=where_kw, columns=PROJECT_COLS).to_table()
+    kw_tbl = kw_tbl.sort_by([("date", "descending")])
+    kw_rows = _dedup_by_email(kw_tbl.to_pylist(), pool)
 
     # --- RRF fusion by entry_id ---
     fused: dict[str, dict[str, Any]] = {}
