@@ -7,6 +7,133 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# ---- Drop integrity level from High to Medium if needed ----
+# Outlook runs at Medium IL in the user's interactive session. When this script
+# is launched from an elevated parent (e.g. WSL started as Administrator), the
+# inherited High IL causes COM activation against Outlook to fail with
+# CO_E_SERVER_EXEC_FAILURE (0x80080005). We work around this by duplicating
+# explorer.exe's Medium-IL primary token and re-execing ourselves under it.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class IlDrop {
+    [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr h, uint da, out IntPtr tok);
+    [DllImport("advapi32.dll", SetLastError=true)] public static extern bool GetTokenInformation(IntPtr tok, int tic, IntPtr ti, int tis, out int rl);
+    [DllImport("advapi32.dll", SetLastError=true)] public static extern bool DuplicateTokenEx(IntPtr h, uint da, IntPtr sa, int il, int tt, out IntPtr nt);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint da, bool inh, int pid);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool CreateProcessWithTokenW(IntPtr hToken, uint flags, string app, string cmd, uint cflags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, int ms);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint c);
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    public struct STARTUPINFO {
+        public int cb; public string lpReserved, lpDesktop, lpTitle;
+        public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public ushort wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public uint dwProcessId, dwThreadId; }
+}
+"@
+
+function Get-CurrentIL {
+    $tok = [IntPtr]::Zero
+    if (-not [IlDrop]::OpenProcessToken([IlDrop]::GetCurrentProcess(), 0x0008, [ref]$tok)) { return 'Unknown' }
+    $rl = 0; [IlDrop]::GetTokenInformation($tok, 25, [IntPtr]::Zero, 0, [ref]$rl) | Out-Null
+    $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal($rl)
+    [IlDrop]::GetTokenInformation($tok, 25, $buf, $rl, [ref]$rl) | Out-Null
+    $sidPtr = [Runtime.InteropServices.Marshal]::ReadIntPtr($buf)
+    $sc = [Runtime.InteropServices.Marshal]::ReadByte($sidPtr, 1)
+    $rid = [Runtime.InteropServices.Marshal]::ReadInt32($sidPtr, 8 + 4*($sc - 1))
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
+    [IlDrop]::CloseHandle($tok) | Out-Null
+    switch ($rid) { 4096{'Low'} 8192{'Medium'} 8448{'MediumPlus'} 12288{'High'} 16384{'System'} default{"RID=$rid"} }
+}
+
+$currentIL = Get-CurrentIL
+if ($currentIL -eq 'High' -or $currentIL -eq 'System') {
+    Write-Host "Detected $currentIL integrity level; re-execing at Medium via explorer.exe token..." -ForegroundColor Yellow
+    $sid = (Get-Process -Id $PID).SessionId
+    $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sid } | Select-Object -First 1
+    if (-not $explorer) { throw "No explorer.exe found in session $sid; cannot drop integrity level." }
+
+    $h = [IlDrop]::OpenProcess(0x0400, $false, $explorer.Id)
+    if ($h -eq [IntPtr]::Zero) { throw "OpenProcess(explorer): $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+    $srcTok = [IntPtr]::Zero
+    if (-not [IlDrop]::OpenProcessToken($h, 0x000B, [ref]$srcTok)) {
+        [IlDrop]::CloseHandle($h) | Out-Null
+        throw "OpenProcessToken(explorer): $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    [IlDrop]::CloseHandle($h) | Out-Null
+    $newTok = [IntPtr]::Zero
+    if (-not [IlDrop]::DuplicateTokenEx($srcTok, 0x02000000, [IntPtr]::Zero, 2, 1, [ref]$newTok)) {
+        [IlDrop]::CloseHandle($srcTok) | Out-Null
+        throw "DuplicateTokenEx: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    [IlDrop]::CloseHandle($srcTok) | Out-Null
+
+    $exe = (Get-Process -Id $PID).Path
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $argString = ''
+    foreach ($k in $PSBoundParameters.Keys) {
+        $v = $PSBoundParameters[$k]
+        $argString += " -$k `"$v`""
+    }
+    $tmpOut = [IO.Path]::Combine($env:TEMP, "outlook-export-$([Guid]::NewGuid().ToString('N')).log")
+    $cmd = "`"$exe`" -NoProfile -ExecutionPolicy Bypass -Command `"& '$scriptPath'$argString *>&1 | Out-File -Encoding utf8 -FilePath '$tmpOut'`""
+
+    $si = New-Object IlDrop+STARTUPINFO
+    $si.cb = [Runtime.InteropServices.Marshal]::SizeOf($si)
+    $pi = New-Object IlDrop+PROCESS_INFORMATION
+    # CREATE_NO_WINDOW = 0x08000000
+    $ok = [IlDrop]::CreateProcessWithTokenW($newTok, 0, $exe, $cmd, 0x08000000, [IntPtr]::Zero, 'C:\Windows\System32', [ref]$si, [ref]$pi)
+    if (-not $ok) {
+        $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        [IlDrop]::CloseHandle($newTok) | Out-Null
+        throw "CreateProcessWithTokenW: $err"
+    }
+    [IlDrop]::CloseHandle($newTok) | Out-Null
+    [IlDrop]::WaitForSingleObject($pi.hProcess, -1) | Out-Null
+    $code = 0
+    [IlDrop]::GetExitCodeProcess($pi.hProcess, [ref]$code) | Out-Null
+    [IlDrop]::CloseHandle($pi.hProcess) | Out-Null
+    [IlDrop]::CloseHandle($pi.hThread) | Out-Null
+    if (Test-Path $tmpOut) {
+        Get-Content -Raw -Encoding UTF8 $tmpOut | Write-Host -NoNewline
+        Remove-Item -Force $tmpOut
+    }
+    exit $code
+}
+
+# ---- Ensure Outlook is running ----
+# COM activation would auto-launch Outlook, but doing it ourselves gives clearer
+# logs and lets us wait until the process is up before binding. We only start it,
+# never quit it, so the user's interactive Outlook is left alone.
+$sid = (Get-Process -Id $PID).SessionId
+$olProc = Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq $sid } | Select-Object -First 1
+if (-not $olProc) {
+    $appPaths = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE'
+    $outlookExe = (Get-ItemProperty -Path $appPaths -ErrorAction SilentlyContinue).'(default)'
+    if (-not $outlookExe -or -not (Test-Path $outlookExe)) {
+        throw "Outlook not running and OUTLOOK.EXE not found via App Paths registry."
+    }
+    Write-Host "Outlook is not running; starting $outlookExe" -ForegroundColor Yellow
+    Start-Process -FilePath $outlookExe -WindowStyle Minimized | Out-Null
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        $olProc = Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -eq $sid } | Select-Object -First 1
+        if ($olProc) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $olProc) { throw "Outlook did not start within 60 seconds." }
+    Start-Sleep -Seconds 3
+}
+
 # ---- constants ----
 $olMailItem = 0
 $PR_HEADERS = 'http://schemas.microsoft.com/mapi/proptag/0x007D001E'
