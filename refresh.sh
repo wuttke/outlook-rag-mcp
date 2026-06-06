@@ -3,6 +3,10 @@
 #   ./refresh.sh                 normal run
 #   ./refresh.sh --max-passes 5  cap export loop
 #   ./refresh.sh --no-ingest     skip step 2
+#
+# The mbox export directory is taken from $OUTLOOK_RAG_EXPORT_DIR (WSL path).
+# When set, it is translated to Windows form and passed to outlook_export.ps1
+# as -OutputDir, and forwarded to ingest.py as --export-dir.
 
 set -euo pipefail
 
@@ -22,12 +26,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Resolve export dir (WSL path) and the Windows equivalent for the PS1 call.
+EXPORT_DIR_WSL="${OUTLOOK_RAG_EXPORT_DIR:-}"
+PS_EXPORT_ARGS=()
+INGEST_EXPORT_ARGS=()
+if [[ -n "$EXPORT_DIR_WSL" ]]; then
+    EXPORT_DIR_WIN="$(wslpath -w "$EXPORT_DIR_WSL")"
+    PS_EXPORT_ARGS=(-OutputDir "$EXPORT_DIR_WIN")
+    INGEST_EXPORT_ARGS=(--export-dir "$EXPORT_DIR_WSL")
+    echo "Export dir: $EXPORT_DIR_WSL (win: $EXPORT_DIR_WIN)"
+fi
+
 echo "=== Step 1: Outlook export (loop until 0 new, max $MAX_PASSES passes) ==="
 total_new=0
 for pass in $(seq 1 "$MAX_PASSES"); do
     log="$LOG_DIR/export-$STAMP-pass$pass.log"
     echo "--- pass $pass --- (log: $log)"
-    powershell.exe -ExecutionPolicy Bypass -File "$PS1_WIN" 2>&1 | tee "$log"
+    powershell.exe -ExecutionPolicy Bypass -File "$PS1_WIN" "${PS_EXPORT_ARGS[@]}" 2>&1 | tee "$log"
     # last "Done. New items this run: N" line
     new=$(grep -oE 'New items this run: [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || echo 0)
     echo "    pass $pass: $new new items"
@@ -50,5 +65,5 @@ ingest_log="$LOG_DIR/ingest-$STAMP.log"
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
 cd "$ROOT"
-time python3 -u ingest.py --batch 16 2>&1 | tee "$ingest_log"
+time python3 -u ingest.py --batch 16 "${INGEST_EXPORT_ARGS[@]}" 2>&1 | tee "$ingest_log"
 echo "=== Step 2 done. Log: $ingest_log ==="

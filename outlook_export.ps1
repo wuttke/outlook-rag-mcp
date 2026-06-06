@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$OutputDir = 'C:\Users\wuttke\Documents\outlook-export',
+    # Output directory for the mbox files and _current_state.json. Resolved
+    # in order: -OutputDir arg, OUTLOOK_RAG_EXPORT_DIR_WIN env var (must be a
+    # Windows-style path), then the historical default below.
+    [string]$OutputDir = $(if ($env:OUTLOOK_RAG_EXPORT_DIR_WIN) { $env:OUTLOOK_RAG_EXPORT_DIR_WIN } else { 'C:\Users\wuttke\Documents\outlook-export' }),
     [int]$MaxItemsPerFolder = 0,  # 0 = no limit; useful for first smoke test
     [switch]$SkipSnapshot          # skip the reconciliation snapshot pass
 )

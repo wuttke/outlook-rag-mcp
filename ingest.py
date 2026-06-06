@@ -3,6 +3,13 @@ Ingest Outlook mbox export into a LanceDB vector store.
 
 Usage:
     python ingest.py [--limit N] [--folders A,B,...] [--batch 32]
+                     [--export-dir /path/to/outlook-export]
+
+The export directory (containing the *.mbox files and _current_state.json
+written by outlook_export.ps1) is resolved in this order:
+  1. --export-dir CLI flag
+  2. OUTLOOK_RAG_EXPORT_DIR environment variable
+  3. the historical default /mnt/c/Users/wuttke/Documents/outlook-export
 """
 from __future__ import annotations
 
@@ -10,6 +17,7 @@ import argparse
 import email
 import json
 import mailbox
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -24,9 +32,15 @@ from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-EXPORT_DIR = Path("/mnt/c/Users/wuttke/Documents/outlook-export")
+EXPORT_DIR = Path(os.environ.get(
+    "OUTLOOK_RAG_EXPORT_DIR",
+    "/mnt/c/Users/wuttke/Documents/outlook-export",
+))
 SNAPSHOT_FILE = EXPORT_DIR / "_current_state.json"
-DB_DIR = Path.home() / "outlook-rag" / "db"
+DB_DIR = Path(os.environ.get(
+    "OUTLOOK_RAG_DB",
+    str(Path.home() / "outlook-rag" / "db"),
+))
 TABLE_NAME = "messages"
 MODEL_NAME = "BAAI/bge-m3"
 EMBED_DIM = 1024
@@ -395,7 +409,16 @@ def main():
                     help="comma-separated top-level folders (default: human mail)")
     ap.add_argument("--batch", type=int, default=16, help="embed batch size")
     ap.add_argument("--reset", action="store_true", help="drop and recreate table")
+    ap.add_argument("--export-dir", type=str, default=None,
+                    help="override mbox export directory "
+                         "(also: OUTLOOK_RAG_EXPORT_DIR env var)")
     args = ap.parse_args()
+
+    if args.export_dir:
+        global EXPORT_DIR, SNAPSHOT_FILE
+        EXPORT_DIR = Path(args.export_dir)
+        SNAPSHOT_FILE = EXPORT_DIR / "_current_state.json"
+    print(f"Export dir: {EXPORT_DIR}")
 
     allowlist = HUMAN_FOLDERS if args.folders is None else set(args.folders.split(","))
     print(f"Allowed top-level folders: {sorted(allowlist)}")

@@ -1,4 +1,4 @@
-# Create a draft mail in the live Outlook session.
+# Create or send a draft mail in the live Outlook session.
 #
 # Always invoked with a single -ArgsFile <path> argument that points at a
 # UTF-8 JSON file with shape:
@@ -10,10 +10,13 @@
 #     "Body": "..." | null,        (plain text body)
 #     "HtmlBody": "..." | null,    (HTML body; takes precedence over Body)
 #     "InReplyToEntryID": "...",   (optional: create as reply to this mail)
-#     "ReplyAll": true | false     (when InReplyToEntryID set; default false)
+#     "ReplyAll": true | false,    (when InReplyToEntryID set; default false)
+#     "SendEntryID": "..."         (optional: send this existing draft;
+#                                   all create-fields above are ignored)
 #   }
 #
-# stdout: single-line JSON { entry_id, subject, draft_folder, web_link? }
+# stdout: single-line JSON { entry_id, subject, draft_folder, ... } on create,
+#         or { entry_id, sent: true, subject, to, ... } on send.
 # stderr/exit-1 on error: JSON { error: "..." }
 
 [CmdletBinding()]
@@ -117,6 +120,35 @@ try {
     $ns = $outlook.GetNamespace('MAPI')
 } catch { Die "Cannot connect to Outlook COM: $($_.Exception.Message)" }
 
+# --- Send path: an existing draft EntryID was supplied --------------------
+$sendId = [string]$a.SendEntryID
+if ($sendId) {
+    try { $item = $ns.GetItemFromID($sendId) } catch { Die "GetItemFromID failed: $($_.Exception.Message)" }
+    if (-not $item) { Die "draft not found for send" }
+    # Sanity: must be a MailItem (olMail = 43)
+    if ($item.Class -ne 43) { Die "item is not a MailItem (class=$($item.Class))" }
+    $snapshotSubject = [string]$item.Subject
+    $snapshotTo      = [string]$item.To
+    $snapshotCc      = [string]$item.CC
+    $snapshotBcc     = [string]$item.BCC
+    if (-not $snapshotTo -and -not $snapshotCc -and -not $snapshotBcc) {
+        Die "refusing to send: draft has no recipients"
+    }
+    try {
+        $item.Send()
+    } catch { Die "Send() failed: $($_.Exception.Message)" }
+    Emit @{
+        entry_id = $sendId
+        sent     = $true
+        subject  = $snapshotSubject
+        to       = $snapshotTo
+        cc       = $snapshotCc
+        bcc      = $snapshotBcc
+    }
+    exit 0
+}
+
+# --- Create path ----------------------------------------------------------
 $inReply = [string]$a.InReplyToEntryID
 if ($inReply) {
     try { $orig = $ns.GetItemFromID($inReply) } catch { Die "GetItemFromID failed: $($_.Exception.Message)" }

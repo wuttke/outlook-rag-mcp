@@ -2,10 +2,14 @@
 MCP server exposing the Outlook RAG store.
 
 Tools:
-  - search_semantic: bge-m3 vector search (German + English), optional metadata filters
-  - search_metadata: SQL-style filter search (folder, sender, date range, keywords)
-  - search_hybrid:   RRF fusion of semantic + keyword/metadata results
-  - get_full_email:  fetch all chunks for a single email by entry_id, reconstructed
+  - search_semantic:   bge-m3 vector search (German + English), optional metadata filters
+  - search_metadata:   SQL-style filter search (folder, sender, date range, keywords)
+  - search_hybrid:     RRF fusion of semantic + keyword/metadata results
+  - get_full_email:    fetch all chunks for a single email by entry_id, reconstructed
+  - list_attachments:  list attachments on a mail via the live Outlook session
+  - read_attachment:   download one attachment as base64 via the live Outlook session
+  - create_draft:      create a new mail or reply in Outlook's Drafts folder (never sends)
+  - send_draft:        send an existing draft by its EntryID via the live Outlook session
 
 Run (stdio transport, for Claude Desktop / VSCode-style MCP clients):
     python mcp_server.py
@@ -483,6 +487,45 @@ def _write_args_file_for_windows(payload: dict[str, Any]) -> tuple[str, str]:
     return str(host_path), win_path
 
 
+def _run_draft_ps(payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+    """Stage `payload` for outlook_draft.ps1 and parse its single-line JSON."""
+    if not DRAFT_PS1.exists():
+        return {"error": f"helper script missing: {DRAFT_PS1}"}
+    try:
+        _, win_args = _write_args_file_for_windows(payload)
+    except FileNotFoundError:
+        return {"error": "powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
+    except Exception as e:
+        return {"error": f"failed to stage args file: {e}"}
+    args = [
+        POWERSHELL_EXE, "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", _wslpath_win(DRAFT_PS1),
+        "-ArgsFile", win_args,
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return {"error": "powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
+    except subprocess.TimeoutExpired:
+        return {"error": "powershell helper timed out"}
+    out = (proc.stdout or "").strip()
+    if not out:
+        return {
+            "error": "empty response from powershell helper",
+            "returncode": proc.returncode,
+            "stderr": (proc.stderr or "").strip()[:1000],
+        }
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {
+            "error": "non-JSON response from powershell helper",
+            "stdout": out[:1000],
+            "stderr": (proc.stderr or "").strip()[:1000],
+        }
+
+
 @mcp.tool()
 def create_draft(
     to: str | None = None,
@@ -513,8 +556,6 @@ def create_draft(
     Returns {entry_id, subject, to, cc, body_format, draft_folder, ...} or
     {error: "..."}.
     """
-    if not DRAFT_PS1.exists():
-        return {"error": f"helper script missing: {DRAFT_PS1}"}
     if not any([to, subject, body, html_body, in_reply_to_entry_id]):
         return {"error": "nothing to do: provide at least one of to/subject/body/html_body/in_reply_to_entry_id"}
     payload = {
@@ -524,39 +565,28 @@ def create_draft(
         "InReplyToEntryID": in_reply_to_entry_id,
         "ReplyAll": bool(reply_all),
     }
-    try:
-        _, win_args = _write_args_file_for_windows(payload)
-    except FileNotFoundError:
-        return {"error": "powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
-    except Exception as e:
-        return {"error": f"failed to stage args file: {e}"}
-    args = [
-        POWERSHELL_EXE, "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", _wslpath_win(DRAFT_PS1),
-        "-ArgsFile", win_args,
-    ]
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
-    except FileNotFoundError:
-        return {"error": "powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
-    except subprocess.TimeoutExpired:
-        return {"error": "powershell helper timed out"}
-    out = (proc.stdout or "").strip()
-    if not out:
-        return {
-            "error": "empty response from powershell helper",
-            "returncode": proc.returncode,
-            "stderr": (proc.stderr or "").strip()[:1000],
-        }
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return {
-            "error": "non-JSON response from powershell helper",
-            "stdout": out[:1000],
-            "stderr": (proc.stderr or "").strip()[:1000],
-        }
+    return _run_draft_ps(payload)
+
+
+@mcp.tool()
+def send_draft(entry_id: str) -> dict[str, Any]:
+    """Send an existing draft from Outlook by its EntryID.
+
+    Looks up the draft via the live Outlook session and calls Send() on it.
+    The draft must already have recipients; otherwise the helper refuses.
+
+    Use this after `create_draft` once the user has confirmed the contents
+    here (so they don't need to switch to Outlook just to hit Send).
+
+    Args:
+        entry_id: Outlook X-Outlook-EntryID of the draft (returned by
+                  `create_draft`).
+
+    Returns {entry_id, sent: true, subject, to, cc, bcc} or {error: "..."}.
+    """
+    if not entry_id:
+        return {"error": "entry_id is required"}
+    return _run_draft_ps({"SendEntryID": entry_id})
 
 
 if __name__ == "__main__":

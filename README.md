@@ -14,7 +14,7 @@ Everything runs locally. No mail or embeddings leave the host.
 │  Windows / MAPI  │   PS1    │  C:\…\outlook-export  │  Python  │  ~/db (1024d)│
 └──────────────────┘          └───────────────────────┘          └──────┬───────┘
          ▲                                                              │
-         │ live COM (attachments, drafts)                               ▼
+         │ live COM (attachments, drafts, send)                          ▼
          │                                                    ┌────────────────────┐
          │                                                    │  MCP server        │
          └────────────────────────────────────────────────────│  search_semantic   │
@@ -24,6 +24,7 @@ Everything runs locally. No mail or embeddings leave the host.
                                                               │  list_attachments  │
                                                               │  read_attachment   │
                                                               │  create_draft      │
+                                                              │  send_draft        │
                                                               └────────────────────┘
 ```
 
@@ -41,9 +42,9 @@ Everything runs locally. No mail or embeddings leave the host.
   longer exist in any allowlisted folder, updates the folder column for
   mails that moved between allowlisted folders, and flips the per-row
   `unread` bit when the snapshot disagrees with the index.
-- **Step 3** (`mcp_server.py`) — FastMCP server exposing seven tools.
-  Vector/metadata search runs against the local LanceDB; attachment and
-  draft tools talk to the live Outlook session via PowerShell + COM.
+- **Step 3** (`mcp_server.py`) — FastMCP server exposing eight tools.
+  Vector/metadata search runs against the local LanceDB; attachment, draft
+  and send tools talk to the live Outlook session via PowerShell + COM.
 - **Driver** (`refresh.sh`) — runs step 1 in a "repeat until 0 new" loop (the
   COM `Restrict()` snapshot can miss items if OST sync is concurrent), then
   chains step 2.
@@ -65,15 +66,59 @@ Everything runs locally. No mail or embeddings leave the host.
 | `db/` *(not in git)* | LanceDB tables |
 | `logs/` *(not in git)* | Per-run export and ingest logs |
 
-## Setup (WSL / Linux)
+## Setup
+
+Prerequisites (Windows side):
+
+- **Classic Outlook desktop** installed, signed in, and able to run
+  unattended. The "new Outlook" preview does not expose the COM automation
+  surface this project uses.
+- The user account that runs `refresh.sh` / the MCP server must own the
+  interactive Outlook session — cross-session COM is blocked by Office.
+- `powershell.exe` (Windows PowerShell 5.1, bundled with Windows) reachable
+  from WSL. If it is not on `$PATH`, set `OUTLOOK_RAG_POWERSHELL` to its
+  absolute path (e.g. `/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe`).
+
+WSL / Linux side:
 
 ```bash
+git clone github.com:wuttke/outlook-rag-mcp.git
+cd outlook-rag-mcp
 python3 -m venv .venv
 source .venv/bin/activate
-pip install sentence-transformers lancedb pyarrow tqdm fastmcp
+pip install sentence-transformers lancedb pyarrow tqdm fastmcp \
+            beautifulsoup4 html2text
 ```
 
 bge-m3 weights (~2.3 GB) are downloaded on first run.
+
+First-time bootstrap:
+
+```bash
+./refresh.sh                  # exports all folders, then full ingest
+```
+
+Cron schedule (every 5 minutes, overlap-safe):
+
+```bash
+crontab -e
+# add:
+*/5 * * * * /home/<you>/outlook-rag-mcp/cron-refresh.sh
+```
+
+Register the MCP server in `~/.augment/settings.json` (or any other MCP
+client) as a stdio server:
+
+```json
+{
+  "mcpServers": {
+    "outlook-rag": {
+      "command": "/home/<you>/outlook-rag-mcp/.venv/bin/python",
+      "args": ["/home/<you>/outlook-rag-mcp/mcp_server.py"]
+    }
+  }
+}
+```
 
 ## Usage
 
@@ -92,6 +137,7 @@ source .venv/bin/activate
 python3 ingest.py --batch 16                       # default human folders
 python3 ingest.py --folders Archiv,Posteingang     # custom allowlist
 python3 ingest.py --reset                          # drop & rebuild table
+python3 ingest.py --export-dir /mnt/d/mail-export  # override mbox path
 ```
 
 Manual export (Windows side, from WSL):
@@ -100,15 +146,12 @@ Manual export (Windows side, from WSL):
 powershell.exe -ExecutionPolicy Bypass -File "$(wslpath -w ./outlook_export.ps1)"
 ```
 
-MCP server:
+MCP server (usually launched by the MCP client, not by hand):
 
 ```bash
 source .venv/bin/activate
 python3 mcp_server.py
 ```
-
-Register in `~/.augment/settings.json` (or any other MCP client) as a stdio
-server pointing at `mcp_server.py`.
 
 ## Tools exposed by the MCP server
 
@@ -121,20 +164,38 @@ server pointing at `mcp_server.py`.
 | `list_attachments` | live Outlook COM — list attachments on a mail (incl. inline) |
 | `read_attachment` | live Outlook COM — fetch one attachment, base64-encoded |
 | `create_draft` | live Outlook COM — compose a new mail or reply, saved as draft |
+| `send_draft` | live Outlook COM — send an existing draft by its `entry_id` |
 
 First call to any vector tool blocks ~25 s while bge-m3 loads; subsequent
 calls are sub-second. The LanceDB table handle is refreshed on every MCP
 request, so newly-ingested mails become searchable without restarting the
-server. Attachment and draft tools require Outlook to be running on the
-Windows side; `create_draft` only ever saves to the Drafts folder, it
-never sends.
+server. Attachment, draft and send tools require Outlook to be running on
+the Windows side; `create_draft` only ever saves to the Drafts folder.
+`send_draft` is the explicit "ship it" step — typical flow is
+`create_draft` → review the returned content here → `send_draft` with the
+same `entry_id`.
 
 ## Configuration
 
-Paths and the folder allowlist are constants at the top of each script:
+The export directory and a few other paths are configurable via environment
+variables (and, for `ingest.py`, a CLI flag). All have working defaults.
 
-- `ingest.py`: `EXPORT_DIR`, `DB_PATH`, `HUMAN_FOLDERS`, chunk sizes.
-- `outlook_export.ps1`: `$OutputDir`, `$SkipRoles`, `$SkipNames`.
+| Variable | Consumed by | Meaning |
+|---|---|---|
+| `OUTLOOK_RAG_EXPORT_DIR` | `ingest.py`, `mcp_server.py`, `refresh.sh` | WSL/Linux path to the mbox export directory. `refresh.sh` translates it via `wslpath -w` and passes it to the PS1 exporter. |
+| `OUTLOOK_RAG_EXPORT_DIR_WIN` | `outlook_export.ps1` | Windows-form path used when the PS1 script is invoked directly (without `refresh.sh`). |
+| `OUTLOOK_RAG_DB` | `ingest.py`, `mcp_server.py` | LanceDB directory (default `~/outlook-rag/db`). |
+| `OUTLOOK_RAG_POWERSHELL` | `mcp_server.py` | Absolute path to `powershell.exe` if it is not on `$PATH`. |
+
+CLI overrides:
+
+- `python3 ingest.py --export-dir /path/to/outlook-export`
+- `powershell.exe ... outlook_export.ps1 -OutputDir 'D:\mail-export'`
+
+The remaining knobs are still constants near the top of each script:
+
+- `ingest.py`: `HUMAN_FOLDERS`, chunk sizes.
+- `outlook_export.ps1`: `$SkipRoles`, `$SkipNames`.
 
 The export script writes **every** mail folder (including tool noise like
 Bitbucket/Nagios/JIRA). `ingest.py` filters by `X-Outlook-Folder` exact match
