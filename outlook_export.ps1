@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$OutputDir = 'C:\Users\wuttke\Documents\outlook-export',
-    [int]$MaxItemsPerFolder = 0   # 0 = no limit; useful for first smoke test
+    [int]$MaxItemsPerFolder = 0,  # 0 = no limit; useful for first smoke test
+    [switch]$SkipSnapshot          # skip the reconciliation snapshot pass
 )
 
 $ErrorActionPreference = 'Stop'
@@ -137,6 +138,7 @@ if (-not $olProc) {
 # ---- constants ----
 $olMailItem = 0
 $PR_HEADERS = 'http://schemas.microsoft.com/mapi/proptag/0x007D001E'
+$PR_MSGID   = 'http://schemas.microsoft.com/mapi/proptag/0x1035001F'
 $SkipRoles = @{ 3='DeletedItems'; 9='Calendar'; 10='Contacts'; 11='Journal';
                 12='Notes'; 13='Tasks'; 19='Conflicts'; 20='SyncIssues';
                 21='LocalFailures'; 22='ServerFailures'; 23='Junk'; 28='ToDo' }
@@ -325,6 +327,75 @@ function SaveState {
     $out | ConvertTo-Json -Depth 6 | Set-Content -Path $StatePath -Encoding UTF8
 }
 
+# ---- snapshot pass ----
+# Enumerates all items in every (non-skipped) folder, capturing just enough to
+# let the ingester reconcile moves, deletions and status changes against
+# LanceDB. Reads only lightweight COM properties (no body), but still touches
+# every item, so this is the slow part of a refresh. Opt-out via -SkipSnapshot.
+$snapshot = @{}
+$snapshotErrors = 0
+function SnapshotFolder($folder, $path) {
+    $items = $folder.Items
+    $total = $items.Count
+    if ($total -eq 0) { return }
+    for ($i = 1; $i -le $total; $i++) {
+        try {
+            $m = $items.Item($i)
+        } catch { $script:snapshotErrors++; continue }
+        try {
+            $msgid = $null
+            try { $msgid = [string]$m.PropertyAccessor.GetProperty($PR_MSGID) } catch {}
+            $eid = $m.EntryID
+            $key = if ($msgid) { $msgid } else { $eid }
+            $unread = $false
+            try { $unread = [bool]$m.UnRead } catch {}
+            $cats = ''
+            try { $cats = [string]$m.Categories } catch {}
+            $subj = ''
+            try { $subj = [string]$m.Subject } catch {}
+            $rt = $null
+            try { $rt = $m.ReceivedTime } catch {}
+            if (-not $rt -or $rt.Year -lt 1990) { try { $rt = $m.SentOn } catch {} }
+            if (-not $rt -or $rt.Year -lt 1990) { try { $rt = $m.CreationTime } catch {} }
+            $script:snapshot[$key] = @{
+                entry_id = $eid
+                folder = $path
+                subject = $subj
+                unread = $unread
+                categories = $cats
+                received_time = if ($rt) { $rt.ToString('o') } else { $null }
+            }
+        } catch { $script:snapshotErrors++ }
+    }
+    Write-Host ("  [snap {0,-40}] {1} items" -f $path, $total)
+}
+function ProcessSnapshot($folder, $path, $parentSkip) {
+    foreach ($sub in $folder.Folders) {
+        $name = $sub.Name
+        $sp = if ($path) { "$path/$name" } else { $name }
+        $skip = $parentSkip -or $skipIds.ContainsKey($sub.EntryID) -or ($SkipNames -contains $name) -or ($sub.DefaultItemType -ne $olMailItem)
+        ProcessSnapshot $sub $sp $skip
+        if ($skip) { continue }
+        if ($sub.Items.Count -eq 0) { continue }
+        SnapshotFolder $sub $sp
+    }
+}
+function WriteSnapshot {
+    $payload = @{
+        version = 1
+        generated_at = (Get-Date).ToString('o')
+        complete = $true
+        errors = $script:snapshotErrors
+        item_count = $script:snapshot.Count
+        items = $script:snapshot
+    }
+    $snapPath = Join-Path $OutputDir '_current_state.json'
+    $tmpPath = "$snapPath.tmp"
+    $payload | ConvertTo-Json -Depth 6 -Compress | Set-Content -Path $tmpPath -Encoding UTF8
+    Move-Item -Force $tmpPath $snapPath
+    Write-Host ("Snapshot: {0} items, {1} errors -> {2}" -f $script:snapshot.Count, $script:snapshotErrors, $snapPath) -ForegroundColor Green
+}
+
 Write-Host "Store : $($store.DisplayName)" -ForegroundColor Cyan
 Write-Host "Out   : $OutputDir" -ForegroundColor Cyan
 Write-Host ""
@@ -332,3 +403,13 @@ Process $root '' $false
 SaveState
 Write-Host ""
 Write-Host ("Done. New items this run: {0}" -f $totalNew) -ForegroundColor Green
+if (-not $SkipSnapshot) {
+    Write-Host ""
+    Write-Host "=== Snapshot pass (for ingest reconciliation) ===" -ForegroundColor Cyan
+    try {
+        ProcessSnapshot $root '' $false
+        WriteSnapshot
+    } catch {
+        Write-Host ("Snapshot pass failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
+}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import email
+import json
 import mailbox
 import re
 import sys
@@ -24,6 +25,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 EXPORT_DIR = Path("/mnt/c/Users/wuttke/Documents/outlook-export")
+SNAPSHOT_FILE = EXPORT_DIR / "_current_state.json"
 DB_DIR = Path.home() / "outlook-rag" / "db"
 TABLE_NAME = "messages"
 MODEL_NAME = "BAAI/bge-m3"
@@ -173,6 +175,109 @@ def parse_date(raw: str | None) -> datetime:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def _norm_key(message_id: str | None, entry_id: str | None) -> str:
+    """Stable per-mail key. Prefer Message-ID (survives folder moves);
+    fall back to EntryID when Message-ID is missing."""
+    mid = (message_id or "").strip()
+    if mid.startswith("<") and mid.endswith(">"):
+        mid = mid[1:-1].strip()
+    if mid:
+        return f"msgid:{mid}"
+    eid = (entry_id or "").strip()
+    return f"entryid:{eid}" if eid else ""
+
+
+def _sql_escape(s: str) -> str:
+    return s.replace("'", "''")
+
+
+def load_snapshot() -> dict | None:
+    """Return {norm_key: {entry_id, folder, ...}} from the PowerShell snapshot,
+    or None if no snapshot file exists yet (no reconciliation in that case)."""
+    if not SNAPSHOT_FILE.exists():
+        return None
+    try:
+        # PowerShell's Set-Content -Encoding UTF8 writes a BOM; tolerate it.
+        with SNAPSHOT_FILE.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"WARN: failed to read snapshot {SNAPSHOT_FILE}: {e}")
+        return None
+    if not data.get("complete", False):
+        print("WARN: snapshot marked incomplete; skipping reconciliation")
+        return None
+    items = data.get("items") or {}
+    out: dict[str, dict] = {}
+    for raw_key, meta in items.items():
+        nk = _norm_key(raw_key, meta.get("entry_id"))
+        if nk:
+            out[nk] = meta
+    print(f"Snapshot: {len(out)} live items "
+          f"(generated_at={data.get('generated_at')})")
+    return out
+
+
+def _folder_top_level(folder_path: str | None) -> str:
+    """Outlook folder paths look like 'Posteingang/Subfolder'. The ingest
+    allowlist matches the top-level segment."""
+    if not folder_path:
+        return ""
+    return folder_path.split("/", 1)[0]
+
+
+def reconcile_with_snapshot(table, snapshot: dict, allowlist: set[str]) -> None:
+    """Delete LanceDB rows that no longer exist (or moved out of allowlist) in
+    Outlook, and update folder for rows that moved within the allowlist."""
+    rows = table.search().select(
+        ["id", "entry_id", "message_id", "folder"]
+    ).limit(10**7).to_list()
+
+    # Group chunks by their canonical key; keep one representative per key.
+    by_key: dict[str, dict] = {}
+    for r in rows:
+        nk = _norm_key(r.get("message_id"), r.get("entry_id"))
+        if not nk:
+            continue
+        by_key.setdefault(nk, r)
+
+    to_delete_eids: list[str] = []
+    to_update: list[tuple[str, str]] = []  # (entry_id, new_top_level_folder)
+    for nk, row in by_key.items():
+        snap = snapshot.get(nk)
+        if snap is None:
+            to_delete_eids.append(row["entry_id"])
+            continue
+        snap_top = _folder_top_level(snap.get("folder"))
+        if snap_top not in allowlist:
+            to_delete_eids.append(row["entry_id"])
+            continue
+        if snap_top and snap_top != row.get("folder"):
+            to_update.append((row["entry_id"], snap_top))
+
+    if to_delete_eids:
+        # Delete in chunks to keep the IN-list bounded.
+        BATCH = 200
+        deleted = 0
+        for i in range(0, len(to_delete_eids), BATCH):
+            chunk = to_delete_eids[i:i + BATCH]
+            quoted = ",".join(f"'{_sql_escape(e)}'" for e in chunk)
+            table.delete(f"entry_id IN ({quoted})")
+            deleted += len(chunk)
+        print(f"Reconcile: deleted {deleted} stale mails "
+              f"({len(to_delete_eids)} entry_ids)")
+
+    if to_update:
+        for eid, new_folder in to_update:
+            table.update(
+                where=f"entry_id = '{_sql_escape(eid)}'",
+                values={"folder": new_folder},
+            )
+        print(f"Reconcile: updated folder for {len(to_update)} mails")
+
+    if not to_delete_eids and not to_update:
+        print("Reconcile: no changes")
+
+
 def iter_messages(mbox_path: Path, folder_allowlist: set[str]):
     """Yield (meta_dict, body_text) for each acceptable message."""
     mb = mailbox.mbox(str(mbox_path))
@@ -254,16 +359,33 @@ def main():
         db.drop_table(TABLE_NAME)
     if TABLE_NAME in db.table_names():
         table = db.open_table(TABLE_NAME)
-        existing_ids = {r["id"] for r in table.search().select(["id"]).limit(10**7).to_list()}
-        print(f"Existing chunks in table: {len(existing_ids)}")
+        snapshot = load_snapshot()
+        if snapshot is not None:
+            reconcile_with_snapshot(table, snapshot, allowlist)
+        rows = table.search().select(
+            ["id", "entry_id", "message_id"]
+        ).limit(10**7).to_list()
+        existing_ids = {r["id"] for r in rows}
+        existing_keys = {
+            _norm_key(r.get("message_id"), r.get("entry_id")) for r in rows
+        }
+        existing_keys.discard("")
+        print(f"Existing chunks in table: {len(existing_ids)} "
+              f"({len(existing_keys)} distinct mails)")
     else:
         table = db.create_table(TABLE_NAME, schema=SCHEMA)
         existing_ids = set()
+        existing_keys = set()
 
     print("Scanning mboxes for new chunks...")
     pending: list[dict] = []
     for rec in build_records(allowlist, args.limit):
         if rec["id"] in existing_ids:
+            continue
+        # Also skip if we already know this mail under a different entry_id
+        # (e.g. it was moved between folders since the last export).
+        nk = _norm_key(rec.get("message_id"), rec.get("entry_id"))
+        if nk and nk in existing_keys:
             continue
         pending.append(rec)
     print(f"New chunks to embed: {len(pending)}")
