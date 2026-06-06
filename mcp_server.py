@@ -12,7 +12,11 @@ Run (stdio transport, for Claude Desktop / VSCode-style MCP clients):
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +25,15 @@ from mcp.server.fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
 
 DB_DIR = Path(os.environ.get("OUTLOOK_RAG_DB", str(Path.home() / "outlook-rag" / "db")))
+EXPORT_DIR = Path(os.environ.get(
+    "OUTLOOK_RAG_EXPORT_DIR",
+    "/mnt/c/Users/wuttke/Documents/outlook-export",
+))
+ATTACH_PS1 = Path(__file__).resolve().parent / "outlook_attachment.ps1"
+POWERSHELL_EXE = os.environ.get("OUTLOOK_RAG_POWERSHELL", "powershell.exe")
 TABLE_NAME = "messages"
 MODEL_NAME = "BAAI/bge-m3"
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB safety cap
 
 mcp = FastMCP("outlook-rag")
 
@@ -296,6 +307,123 @@ def search_hybrid(
         h["sources"] = item["src"]
         out.append(h)
     return out
+
+
+def _wslpath_win(p: str | Path) -> str:
+    """Translate a WSL/Linux path to a Windows path usable by powershell.exe."""
+    r = subprocess.run(
+        ["wslpath", "-w", str(p)],
+        capture_output=True, text=True, check=True,
+    )
+    return r.stdout.strip()
+
+
+def _run_attachment_ps(action: str, entry_id: str, **kwargs) -> dict[str, Any]:
+    """Invoke outlook_attachment.ps1 and parse its single-line JSON stdout."""
+    if not ATTACH_PS1.exists():
+        return {"error": f"helper script missing: {ATTACH_PS1}"}
+    args = [
+        POWERSHELL_EXE,
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", _wslpath_win(ATTACH_PS1),
+        "-Action", action,
+        "-EntryID", entry_id,
+    ]
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        args.extend([f"-{k}", str(v)])
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        return {"error": f"powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
+    except subprocess.TimeoutExpired:
+        return {"error": "powershell helper timed out"}
+    out = (proc.stdout or "").strip()
+    if not out:
+        return {
+            "error": "empty response from powershell helper",
+            "returncode": proc.returncode,
+            "stderr": (proc.stderr or "").strip()[:1000],
+        }
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {
+            "error": "non-JSON response from powershell helper",
+            "returncode": proc.returncode,
+            "stdout": out[:1000],
+            "stderr": (proc.stderr or "").strip()[:1000],
+        }
+
+
+@mcp.tool()
+def list_attachments(entry_id: str) -> dict[str, Any]:
+    """List attachments on a mail by talking to the live Outlook session.
+
+    Uses Outlook COM via a PowerShell helper. Inline images (e.g.
+    image001.png) and inline embedded items are included, matching what
+    Outlook itself shows under "Attachments".
+
+    Args:
+        entry_id: Outlook X-Outlook-EntryID (returned by other tools).
+
+    Returns {entry_id, subject, attachments: [{filename, display_name,
+    size, type, index}, ...]} or {error: "..."}.
+    """
+    return _run_attachment_ps("list", entry_id)
+
+
+@mcp.tool()
+def read_attachment(
+    entry_id: str,
+    filename: str,
+    max_bytes: int = MAX_ATTACHMENT_BYTES,
+) -> dict[str, Any]:
+    """Read one attachment from a mail via the live Outlook session.
+
+    Writes the attachment to a temporary file on the Windows side via
+    `Attachment.SaveAsFile`, then reads it back and returns its bytes
+    base64-encoded.
+
+    Args:
+        entry_id: Outlook X-Outlook-EntryID.
+        filename: exact attachment filename (as listed by list_attachments).
+        max_bytes: hard cap; larger attachments return a size-only error.
+
+    Returns {filename, display_name, size, type, content_base64} or
+    {error: "...", available: [...]}.
+    """
+    with tempfile.TemporaryDirectory(prefix="outlook-att-") as td:
+        # SaveAsFile needs a Windows path; write inside our WSL tempdir and
+        # translate. Filename is sanitized to avoid path traversal/quoting.
+        safe_name = Path(filename).name or "attachment.bin"
+        host_path = Path(td) / safe_name
+        win_path = _wslpath_win(host_path)
+        result = _run_attachment_ps(
+            "read", entry_id, Filename=filename, OutFile=win_path,
+        )
+        if result.get("error"):
+            return result
+        try:
+            data = host_path.read_bytes()
+        except FileNotFoundError:
+            return {"error": f"helper wrote no file at {host_path}",
+                    "helper_result": result}
+        if len(data) > max_bytes:
+            return {
+                "error": f"attachment too large ({len(data)} > {max_bytes})",
+                "filename": result.get("filename"),
+                "size": len(data),
+                "type": result.get("type"),
+            }
+        result["size"] = len(data)
+        result.pop("out_file", None)
+        result["content_base64"] = base64.b64encode(data).decode("ascii")
+        return result
 
 
 if __name__ == "__main__":
