@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -31,7 +32,28 @@ EXPORT_DIR = Path(os.environ.get(
 ))
 ATTACH_PS1 = Path(__file__).resolve().parent / "outlook_attachment.ps1"
 DRAFT_PS1 = Path(__file__).resolve().parent / "outlook_draft.ps1"
-POWERSHELL_EXE = os.environ.get("OUTLOOK_RAG_POWERSHELL", "powershell.exe")
+
+
+def _resolve_powershell_exe() -> str:
+    """Resolve powershell.exe regardless of the launching context's PATH.
+
+    Order: OUTLOOK_RAG_POWERSHELL env var, then shutil.which, then the
+    well-known WSL path. Falls back to the bare name so the friendly
+    FileNotFoundError handling downstream still kicks in if all of the
+    above miss."""
+    explicit = os.environ.get("OUTLOOK_RAG_POWERSHELL")
+    if explicit:
+        return explicit
+    found = shutil.which("powershell.exe")
+    if found:
+        return found
+    fallback = "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe"
+    if Path(fallback).exists():
+        return fallback
+    return "powershell.exe"
+
+
+POWERSHELL_EXE = _resolve_powershell_exe()
 TABLE_NAME = "messages"
 MODEL_NAME = "BAAI/bge-m3"
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB safety cap
@@ -504,6 +526,8 @@ def create_draft(
     }
     try:
         _, win_args = _write_args_file_for_windows(payload)
+    except FileNotFoundError:
+        return {"error": "powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
     except Exception as e:
         return {"error": f"failed to stage args file: {e}"}
     args = [
@@ -514,6 +538,8 @@ def create_draft(
     ]
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return {"error": "powershell.exe not found (set OUTLOOK_RAG_POWERSHELL)"}
     except subprocess.TimeoutExpired:
         return {"error": "powershell helper timed out"}
     out = (proc.stdout or "").strip()
