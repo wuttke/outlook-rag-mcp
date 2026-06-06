@@ -30,6 +30,7 @@ EXPORT_DIR = Path(os.environ.get(
     "/mnt/c/Users/wuttke/Documents/outlook-export",
 ))
 ATTACH_PS1 = Path(__file__).resolve().parent / "outlook_attachment.ps1"
+DRAFT_PS1 = Path(__file__).resolve().parent / "outlook_draft.ps1"
 POWERSHELL_EXE = os.environ.get("OUTLOOK_RAG_POWERSHELL", "powershell.exe")
 TABLE_NAME = "messages"
 MODEL_NAME = "BAAI/bge-m3"
@@ -424,6 +425,101 @@ def read_attachment(
         result.pop("out_file", None)
         result["content_base64"] = base64.b64encode(data).decode("ascii")
         return result
+
+
+def _write_args_file_for_windows(payload: dict[str, Any]) -> tuple[str, str]:
+    """Serialise `payload` to a UTF-8 JSON file under the Windows %TEMP%
+    directory and return (host_path, win_path). The Windows-side helper is
+    responsible for deleting the file once it has read it."""
+    win_tmp = subprocess.run(
+        [POWERSHELL_EXE, "-NoProfile", "-Command",
+         "[Console]::Out.Write($env:TEMP)"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if not win_tmp:
+        raise RuntimeError("could not resolve Windows %TEMP%")
+    host_tmp = Path(subprocess.run(
+        ["wslpath", "-u", win_tmp],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip())
+    import uuid
+    name = f"outlook-draft-args-{uuid.uuid4().hex}.json"
+    host_path = host_tmp / name
+    host_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    win_path = _wslpath_win(host_path)
+    return str(host_path), win_path
+
+
+@mcp.tool()
+def create_draft(
+    to: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html_body: str | None = None,
+    in_reply_to_entry_id: str | None = None,
+    reply_all: bool = False,
+) -> dict[str, Any]:
+    """Create a mail in Outlook's Drafts folder (never sends).
+
+    Either compose a new mail, or — if `in_reply_to_entry_id` is given —
+    create a draft reply pre-populated with quoted history. The draft is
+    saved (visible in Outlook's Drafts folder) so the user can review and
+    send it manually.
+
+    Args:
+        to:                 semicolon-separated recipients (or None when replying).
+        subject:            mail subject (defaults to the reply subject when replying).
+        body:               plain-text body. Ignored if html_body is set.
+        cc, bcc:            optional additional recipient lists.
+        html_body:          HTML body; takes precedence over `body`.
+        in_reply_to_entry_id: when set, create as Reply/ReplyAll to that mail.
+        reply_all:          when replying, use ReplyAll instead of Reply.
+
+    Returns {entry_id, subject, to, cc, body_format, draft_folder, ...} or
+    {error: "..."}.
+    """
+    if not DRAFT_PS1.exists():
+        return {"error": f"helper script missing: {DRAFT_PS1}"}
+    if not any([to, subject, body, html_body, in_reply_to_entry_id]):
+        return {"error": "nothing to do: provide at least one of to/subject/body/html_body/in_reply_to_entry_id"}
+    payload = {
+        "To": to, "Cc": cc, "Bcc": bcc,
+        "Subject": subject,
+        "Body": body, "HtmlBody": html_body,
+        "InReplyToEntryID": in_reply_to_entry_id,
+        "ReplyAll": bool(reply_all),
+    }
+    try:
+        _, win_args = _write_args_file_for_windows(payload)
+    except Exception as e:
+        return {"error": f"failed to stage args file: {e}"}
+    args = [
+        POWERSHELL_EXE, "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", _wslpath_win(DRAFT_PS1),
+        "-ArgsFile", win_args,
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"error": "powershell helper timed out"}
+    out = (proc.stdout or "").strip()
+    if not out:
+        return {
+            "error": "empty response from powershell helper",
+            "returncode": proc.returncode,
+            "stderr": (proc.stderr or "").strip()[:1000],
+        }
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {
+            "error": "non-JSON response from powershell helper",
+            "stdout": out[:1000],
+            "stderr": (proc.stderr or "").strip()[:1000],
+        }
 
 
 if __name__ == "__main__":
