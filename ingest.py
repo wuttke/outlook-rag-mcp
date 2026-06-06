@@ -227,10 +227,13 @@ def _folder_top_level(folder_path: str | None) -> str:
 
 def reconcile_with_snapshot(table, snapshot: dict, allowlist: set[str]) -> None:
     """Delete LanceDB rows that no longer exist (or moved out of allowlist) in
-    Outlook, and update folder for rows that moved within the allowlist."""
-    rows = table.search().select(
-        ["id", "entry_id", "message_id", "folder"]
-    ).limit(10**7).to_list()
+    Outlook, update folder for rows that moved within the allowlist, and sync
+    the `unread` flag against the snapshot."""
+    has_unread = "unread" in [f.name for f in table.schema]
+    cols = ["id", "entry_id", "message_id", "folder"]
+    if has_unread:
+        cols.append("unread")
+    rows = table.search().select(cols).limit(10**7).to_list()
 
     # Group chunks by their canonical key; keep one representative per key.
     by_key: dict[str, dict] = {}
@@ -242,6 +245,8 @@ def reconcile_with_snapshot(table, snapshot: dict, allowlist: set[str]) -> None:
 
     to_delete_eids: list[str] = []
     to_update: list[tuple[str, str]] = []  # (entry_id, new_top_level_folder)
+    to_mark_unread: list[str] = []
+    to_mark_read: list[str] = []
     for nk, row in by_key.items():
         snap = snapshot.get(nk)
         if snap is None:
@@ -253,6 +258,12 @@ def reconcile_with_snapshot(table, snapshot: dict, allowlist: set[str]) -> None:
             continue
         if snap_top and snap_top != row.get("folder"):
             to_update.append((row["entry_id"], snap_top))
+        if has_unread:
+            snap_unread = bool(snap.get("unread"))
+            if snap_unread != bool(row.get("unread")):
+                (to_mark_unread if snap_unread else to_mark_read).append(
+                    row["entry_id"]
+                )
 
     if to_delete_eids:
         # Delete in chunks to keep the IN-list bounded.
@@ -274,7 +285,22 @@ def reconcile_with_snapshot(table, snapshot: dict, allowlist: set[str]) -> None:
             )
         print(f"Reconcile: updated folder for {len(to_update)} mails")
 
-    if not to_delete_eids and not to_update:
+    for eids, value in ((to_mark_unread, True), (to_mark_read, False)):
+        if not eids:
+            continue
+        BATCH = 200
+        for i in range(0, len(eids), BATCH):
+            chunk = eids[i:i + BATCH]
+            quoted = ",".join(f"'{_sql_escape(e)}'" for e in chunk)
+            table.update(
+                where=f"entry_id IN ({quoted})",
+                values={"unread": value},
+            )
+        print(f"Reconcile: marked {len(eids)} mails as "
+              f"{'unread' if value else 'read'}")
+
+    if (not to_delete_eids and not to_update
+            and not to_mark_unread and not to_mark_read):
         print("Reconcile: no changes")
 
 
@@ -317,19 +343,44 @@ SCHEMA = pa.schema([
     pa.field("message_id", pa.string()),
     pa.field("attachments", pa.string()),
     pa.field("body_chunk", pa.string()),
+    pa.field("unread", pa.bool_()),
     pa.field("vector", pa.list_(pa.float32(), EMBED_DIM)),
 ])
 
 
-def build_records(folder_allowlist: set[str], limit: int | None):
-    """Yield record dicts (without vector) from all mboxes."""
+def ensure_unread_column(table) -> None:
+    """One-time migration: add the `unread` column to existing tables that
+    pre-date the schema change. Default is `false`; the next reconciliation
+    pass corrects rows whose snapshot disagrees. The column is altered to
+    nullable so subsequent table.update() calls don't break scans."""
+    fields = {f.name: f for f in table.schema}
+    if "unread" not in fields:
+        print("Migrating table: adding `unread` column (default false)...")
+        table.add_columns({"unread": "false"})
+        fields = {f.name: f for f in table.schema}
+    if not fields["unread"].nullable:
+        table.alter_columns({"path": "unread", "nullable": True})
+        print("Migrating table: marked `unread` nullable.")
+
+
+def build_records(folder_allowlist: set[str], limit: int | None,
+                  snapshot: dict | None = None):
+    """Yield record dicts (without vector) from all mboxes. When `snapshot`
+    is provided, populate `unread` from it; default `False` otherwise."""
     mbox_files = sorted(EXPORT_DIR.glob("*.mbox"))
     total = 0
     for mb_path in mbox_files:
         for meta, body in iter_messages(mb_path, folder_allowlist):
+            unread = False
+            if snapshot is not None:
+                nk = _norm_key(meta.get("message_id"), meta.get("entry_id"))
+                snap = snapshot.get(nk) if nk else None
+                if snap is not None:
+                    unread = bool(snap.get("unread"))
             chunks = chunk_text(body)
             for idx, ch in enumerate(chunks):
-                rec = {**meta, "chunk_idx": idx, "body_chunk": ch}
+                rec = {**meta, "chunk_idx": idx, "body_chunk": ch,
+                       "unread": unread}
                 rec["id"] = f"{meta['entry_id']}#{idx}"
                 yield rec
                 total += 1
@@ -357,9 +408,10 @@ def main():
     db = lancedb.connect(str(DB_DIR))
     if args.reset and TABLE_NAME in db.table_names():
         db.drop_table(TABLE_NAME)
+    snapshot = load_snapshot()
     if TABLE_NAME in db.table_names():
         table = db.open_table(TABLE_NAME)
-        snapshot = load_snapshot()
+        ensure_unread_column(table)
         if snapshot is not None:
             reconcile_with_snapshot(table, snapshot, allowlist)
         rows = table.search().select(
@@ -379,7 +431,7 @@ def main():
 
     print("Scanning mboxes for new chunks...")
     pending: list[dict] = []
-    for rec in build_records(allowlist, args.limit):
+    for rec in build_records(allowlist, args.limit, snapshot=snapshot):
         if rec["id"] in existing_ids:
             continue
         # Also skip if we already know this mail under a different entry_id

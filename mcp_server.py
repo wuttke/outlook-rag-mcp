@@ -44,7 +44,7 @@ _table = None
 PROJECT_COLS = [
     "entry_id", "chunk_idx", "folder", "subject",
     "from_addr", "to_addr", "cc_addr", "date",
-    "message_id", "attachments", "body_chunk",
+    "message_id", "attachments", "body_chunk", "unread",
 ]
 
 
@@ -79,6 +79,7 @@ def _build_where(
     since: str | None = None,
     until: str | None = None,
     keywords: list[str] | None = None,
+    unread: bool | None = None,
 ) -> str | None:
     f: list[str] = []
     if folder:
@@ -97,6 +98,8 @@ def _build_where(
         for kw in keywords:
             e = _esc(kw)
             f.append(f"(subject LIKE '%{e}%' OR body_chunk LIKE '%{e}%')")
+    if unread is not None:
+        f.append(f"unread = {'true' if unread else 'false'}")
     return " AND ".join(f) if f else None
 
 
@@ -110,6 +113,7 @@ def _format(r: dict, score: float | None = None) -> dict[str, Any]:
         "from": r.get("from_addr"),
         "to": r.get("to_addr"),
         "subject": r.get("subject"),
+        "unread": bool(r.get("unread")),
         "chunk_idx": r.get("chunk_idx"),
         "entry_id": r.get("entry_id"),
         "body": body,
@@ -142,6 +146,7 @@ def search_semantic(
     to_addr: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    unread: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Semantic search over Outlook mail using bge-m3 (multilingual).
 
@@ -153,13 +158,14 @@ def search_semantic(
         to_addr: substring matched against recipient email
         since: ISO date YYYY-MM-DD (inclusive lower bound on Date header)
         until: ISO date YYYY-MM-DD (inclusive upper bound)
+        unread: True to keep only unread mails, False for only read, None for both
 
     Returns a list of hits (most similar first) with score in [0,1].
     """
     qvec = model().encode([query], normalize_embeddings=True)[0].tolist()
     builder = table().search(qvec).metric("cosine")
     where = _build_where(folder=folder, from_addr=from_addr, to_addr=to_addr,
-                         since=since, until=until)
+                         since=since, until=until, unread=unread)
     if where:
         builder = builder.where(where, prefilter=True)
     rows = builder.limit(k * 3).to_list()
@@ -176,6 +182,7 @@ def search_metadata(
     subject_contains: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    unread: bool | None = None,
     k: int = 20,
     sort: str = "date_desc",
 ) -> list[dict[str, Any]]:
@@ -192,12 +199,13 @@ def search_metadata(
         subject_contains: substring matched against subject
         since: ISO date YYYY-MM-DD
         until: ISO date YYYY-MM-DD
+        unread: True for only unread, False for only read, None for both
         k: number of distinct emails to return
         sort: 'date_desc' (default) or 'date_asc'
     """
     where = _build_where(folder=folder, from_addr=from_addr, to_addr=to_addr,
                          subject_contains=subject_contains, since=since,
-                         until=until, keywords=keywords)
+                         until=until, keywords=keywords, unread=unread)
     ds = table().to_lance()
     tbl = ds.scanner(filter=where, columns=PROJECT_COLS).to_table()
     order = "ascending" if sort == "date_asc" else "descending"
@@ -248,6 +256,7 @@ def search_hybrid(
     to_addr: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    unread: bool | None = None,
     rrf_k: int = 60,
 ) -> list[dict[str, Any]]:
     """Reciprocal-Rank-Fusion of semantic and keyword/metadata search.
@@ -263,6 +272,7 @@ def search_hybrid(
         keywords: AND-matched substrings for the keyword leg (defaults to [query] if None)
         k: number of distinct emails to return
         folder, from_addr, to_addr, since, until: filters applied to both legs
+        unread: True for only unread, False for only read, None for both
         rrf_k: RRF dampening constant (default 60)
     """
     if not keywords:
@@ -273,14 +283,15 @@ def search_hybrid(
     qvec = model().encode([query], normalize_embeddings=True)[0].tolist()
     sb = table().search(qvec).metric("cosine")
     where_sem = _build_where(folder=folder, from_addr=from_addr, to_addr=to_addr,
-                             since=since, until=until)
+                             since=since, until=until, unread=unread)
     if where_sem:
         sb = sb.where(where_sem, prefilter=True)
     sem_rows = _dedup_by_email(sb.limit(pool * 3).to_list(), pool)
 
     # --- keyword leg ---
     where_kw = _build_where(folder=folder, from_addr=from_addr, to_addr=to_addr,
-                            since=since, until=until, keywords=keywords)
+                            since=since, until=until, keywords=keywords,
+                            unread=unread)
     ds = table().to_lance()
     kw_tbl = ds.scanner(filter=where_kw, columns=PROJECT_COLS).to_table()
     kw_tbl = kw_tbl.sort_by([("date", "descending")])
